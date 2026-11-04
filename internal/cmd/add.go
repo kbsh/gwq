@@ -4,10 +4,15 @@ import (
 	"fmt"
 	"io"
 	"os"
+	"path/filepath"
+	"strings"
 	"time"
 
 	"github.com/d-kuro/gwq/internal/duration"
+	"github.com/d-kuro/gwq/internal/git"
 	"github.com/d-kuro/gwq/internal/registry"
+	"github.com/d-kuro/gwq/internal/worktree"
+	"github.com/d-kuro/gwq/pkg/models"
 	"github.com/spf13/cobra"
 )
 
@@ -17,24 +22,31 @@ var (
 	addForce       bool
 	addStay        bool
 	addExpires     string
+	addPath        string
 )
 
 // addCmd represents the add command.
 var addCmd = &cobra.Command{
-	Use:   "add [branch] [path]",
+	Use:   "add [branch] [base]",
 	Short: "Create a new worktree",
 	Long: `Create a new worktree for the specified branch.
 
-If no path is provided, it will be generated based on the configuration template.
+If [base] is provided, a new branch is created from it (e.g. origin/main).
+This implies -b. Without [base], -b creates the new branch from HEAD.
+
+If --path is not provided, the path is generated based on the configuration template.
 Use -i flag to interactively select a branch using fuzzy finder.`,
 	Example: `  # Create worktree from existing branch
   gwq add feature/new-ui
 
   # Create at specific path
-  gwq add feature/new-ui ~/projects/myapp-feature
+  gwq add feature/new-ui --path ~/projects/myapp-feature
 
-  # Create new branch and worktree
+  # Create new branch and worktree from HEAD
   gwq add -b feature/api-v2
+
+  # Create new branch and worktree from a remote branch
+  gwq add feature/api-v2 origin/main
 
   # Interactive branch selection
   gwq add -i
@@ -47,6 +59,7 @@ Use -i flag to interactively select a branch using fuzzy finder.`,
 
   # Create worktree expiring in 1 hour
   gwq add --expires 1h hotfix/quick-test`,
+	Args:              cobra.MaximumNArgs(2),
 	RunE:              runAdd,
 	ValidArgsFunction: getBranchCompletions,
 }
@@ -59,12 +72,12 @@ func init() {
 	addCmd.Flags().BoolVarP(&addForce, "force", "f", false, "Overwrite existing directory")
 	addCmd.Flags().BoolVarP(&addStay, "stay", "s", false, "Stay in worktree directory after creation")
 	addCmd.Flags().StringVar(&addExpires, "expires", "", "Set expiration (e.g., 1d, 7d, 1h)")
+	addCmd.Flags().StringVarP(&addPath, "path", "p", "", "Worktree path (default: generated from naming template)")
 }
 
 func runAdd(cmd *cobra.Command, args []string) error {
 	return ExecuteWithArgs(true, func(ctx *CommandContext, cmd *cobra.Command, args []string) error {
-		var branch string
-		var path string
+		var opts worktree.AddOptions
 
 		if addInteractive {
 			if len(args) > 0 {
@@ -81,23 +94,34 @@ func runAdd(cmd *cobra.Command, args []string) error {
 				return fmt.Errorf("branch selection cancelled")
 			}
 
-			branch = selectedBranch.Name
-			if selectedBranch.IsRemote {
-				branch = selectedBranch.Name[len("origin/"):]
-				addBranch = true
+			remotes, err := ctx.Git.ListRemotes()
+			if err != nil {
+				return err
+			}
+
+			opts, err = resolveSelectedBranch(*selectedBranch, branches, remotes, addBranch)
+			if err != nil {
+				return err
 			}
 		} else {
-			if len(args) < 1 {
-				return fmt.Errorf("branch name is required")
+			var err error
+			opts, err = resolveAddArgs(args, addBranch)
+			if err != nil {
+				return err
 			}
-			branch = args[0]
-			if len(args) > 1 {
-				path = args[1]
+		}
+		opts.Path = addPath
+
+		// Validate base before preparing the path so a bad base (typically
+		// the old `gwq add <branch> <path>` syntax) fails without side effects.
+		if opts.Base != "" {
+			if err := validateBase(opts.Base, ctx.Git.IsCommitish); err != nil {
+				return err
 			}
 		}
 
-		if path != "" && !addForce {
-			if err := ctx.WorktreeManager.ValidateWorktreePath(path); err != nil {
+		if opts.Path != "" && !addForce {
+			if err := ctx.WorktreeManager.ValidateWorktreePath(opts.Path); err != nil {
 				return err
 			}
 		}
@@ -115,7 +139,7 @@ func runAdd(cmd *cobra.Command, args []string) error {
 			expiresDuration = d
 		}
 
-		worktreePath, err := ctx.WorktreeManager.Add(branch, path, addBranch)
+		worktreePath, err := ctx.WorktreeManager.Add(opts)
 		if err != nil {
 			return err
 		}
@@ -134,7 +158,7 @@ func runAdd(cmd *cobra.Command, args []string) error {
 
 			entry := &registry.WorktreeEntry{
 				Repository: repoURL,
-				Branch:     branch,
+				Branch:     opts.Branch,
 				Path:       worktreePath,
 				IsMain:     false,
 				ExpiresAt:  expiresAt,
@@ -150,7 +174,7 @@ func runAdd(cmd *cobra.Command, args []string) error {
 			isCdShimActive(),
 			ctx.Config.Cd.AutoCdOnAdd,
 			addResult{
-				Branch:    branch,
+				Branch:    opts.Branch,
 				Path:      worktreePath,
 				Stay:      addStay,
 				ExpiresAt: expiresAt,
@@ -159,6 +183,77 @@ func runAdd(cmd *cobra.Command, args []string) error {
 		)
 		return nil
 	})(cmd, args)
+}
+
+// resolveAddArgs turns `gwq add <branch> [base]` positional arguments into
+// AddOptions. Specifying base implies creating a new branch.
+func resolveAddArgs(args []string, createBranch bool) (worktree.AddOptions, error) {
+	if len(args) < 1 {
+		return worktree.AddOptions{}, fmt.Errorf("branch name is required")
+	}
+
+	opts := worktree.AddOptions{Branch: args[0], CreateBranch: createBranch}
+	if len(args) > 1 {
+		opts.Base = args[1]
+		opts.CreateBranch = true
+	}
+	return opts, nil
+}
+
+// validateBase checks that base names a commit. Because the second argument
+// used to be the worktree path, errors point users at --path when base looks
+// like or exists as a path.
+func validateBase(base string, isCommitish func(string) bool) error {
+	pathHint := fmt.Errorf(
+		"second argument %q looks like a path, but it is the base branch; use --path to set the worktree path", base)
+
+	if looksLikePath(base) {
+		return pathHint
+	}
+	if isCommitish(base) {
+		return nil
+	}
+	if _, err := os.Stat(base); err == nil {
+		return pathHint
+	}
+	return fmt.Errorf("base %q is not a valid branch or commit (to set the worktree path, use --path)", base)
+}
+
+// looksLikePath reports whether s is a filesystem path rather than a
+// commit-ish. Ref names can never start with "/", "." or "~", nor contain a
+// backslash, so valid bases (including revisions like "main~1") never match.
+func looksLikePath(s string) bool {
+	return strings.HasPrefix(s, "/") ||
+		strings.HasPrefix(s, ".") ||
+		strings.HasPrefix(s, "~") ||
+		strings.Contains(s, `\`) ||
+		filepath.IsAbs(s)
+}
+
+// resolveSelectedBranch turns a branch picked in the fuzzy finder into
+// AddOptions. Picking a remote branch such as "origin/feature/x" checks out
+// the local "feature/x" if it already exists (like `git switch`), and
+// otherwise creates it starting at the remote branch. An explicit -b is
+// always honored so it is never silently dropped.
+func resolveSelectedBranch(selected models.Branch, all []models.Branch, remotes []string, createBranch bool) (worktree.AddOptions, error) {
+	if !selected.IsRemote {
+		return worktree.AddOptions{Branch: selected.Name, CreateBranch: createBranch}, nil
+	}
+
+	_, local, ok := git.SplitRemoteBranch(selected.Name, remotes)
+	if !ok {
+		return worktree.AddOptions{}, fmt.Errorf("cannot determine remote of branch %q", selected.Name)
+	}
+
+	if !createBranch {
+		for _, b := range all {
+			if !b.IsRemote && b.Name == local {
+				return worktree.AddOptions{Branch: local}, nil
+			}
+		}
+	}
+
+	return worktree.AddOptions{Branch: local, Base: selected.Name, CreateBranch: true}, nil
 }
 
 // addResult carries the outcome of a successful `gwq add` into the

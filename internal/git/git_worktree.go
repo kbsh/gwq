@@ -64,32 +64,41 @@ func (g *Git) ListWorktrees() ([]models.Worktree, error) {
 }
 
 // AddWorktree creates a new worktree.
-func (g *Git) AddWorktree(path, branch string, createBranch bool) error {
+//
+// If createBranch is true, a new branch is created starting at base
+// (HEAD when base is empty). Otherwise the existing branch is checked out
+// and base must be empty.
+func (g *Git) AddWorktree(path, branch, base string, createBranch bool) error {
+	// Refuse values git would parse as options (e.g. a base of "--force").
+	for _, v := range []string{branch, base} {
+		if strings.HasPrefix(v, "-") {
+			return fmt.Errorf("invalid ref %q: must not start with '-'", v)
+		}
+	}
+
 	args := []string{"worktree", "add"}
 
-	if createBranch {
+	switch {
+	case createBranch:
+		// Only track base when it is the same-named remote branch
+		// (origin/feature -> feature). Otherwise "feature/x from origin/main"
+		// would get origin/main as its upstream, and `git pull`/`git push`
+		// in the worktree would target main.
+		if base != "" && !strings.HasSuffix(base, "/"+branch) {
+			args = append(args, "--no-track")
+		}
 		args = append(args, "-b", branch, path)
-	} else {
+		if base != "" {
+			args = append(args, base)
+		}
+	case base != "":
+		return fmt.Errorf("base %q requires creating a new branch", base)
+	default:
 		args = append(args, path, branch)
 	}
 
 	if _, err := g.run(args...); err != nil {
 		return fmt.Errorf("failed to add worktree: %w", err)
-	}
-
-	return nil
-}
-
-// AddWorktreeFromBase creates a new worktree with a branch from a specific base branch.
-func (g *Git) AddWorktreeFromBase(path, branch, baseBranch string) error {
-	args := []string{"worktree", "add", "-b", branch, path}
-
-	if baseBranch != "" {
-		args = append(args, baseBranch)
-	}
-
-	if _, err := g.run(args...); err != nil {
-		return fmt.Errorf("failed to add worktree from base branch %s: %w", baseBranch, err)
 	}
 
 	return nil

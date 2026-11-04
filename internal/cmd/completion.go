@@ -7,6 +7,7 @@ import (
 	"github.com/d-kuro/gwq/internal/git"
 	"github.com/d-kuro/gwq/internal/registry"
 	"github.com/d-kuro/gwq/internal/worktree"
+	"github.com/d-kuro/gwq/pkg/models"
 	"github.com/spf13/cobra"
 )
 
@@ -41,9 +42,10 @@ func getWorktreeCompletions(_ *cobra.Command, args []string, toComplete string) 
 	return completions, cobra.ShellCompDirectiveNoFileComp
 }
 
-// getBranchCompletions returns branch names for shell completion
+// getBranchCompletions returns branch names for shell completion of
+// `gwq add [branch] [base]`.
 func getBranchCompletions(_ *cobra.Command, args []string, toComplete string) ([]string, cobra.ShellCompDirective) {
-	if len(args) > 0 {
+	if len(args) > 1 {
 		return nil, cobra.ShellCompDirectiveNoFileComp
 	}
 
@@ -57,18 +59,64 @@ func getBranchCompletions(_ *cobra.Command, args []string, toComplete string) ([
 		return nil, cobra.ShellCompDirectiveNoFileComp
 	}
 
-	var completions []string
-	for _, branch := range branches {
-		if strings.HasPrefix(branch.Name, toComplete) {
-			desc := "Local branch"
-			if branch.IsRemote {
-				desc = "Remote branch"
-			}
-			completions = append(completions, fmt.Sprintf("%s\t%s", branch.Name, desc))
+	if len(args) == 1 {
+		return baseCompletions(branches, toComplete), cobra.ShellCompDirectiveNoFileComp
+	}
+
+	remotes, err := g.ListRemotes()
+	if err != nil {
+		return nil, cobra.ShellCompDirectiveNoFileComp
+	}
+	return addBranchCompletions(branches, remotes, toComplete), cobra.ShellCompDirectiveNoFileComp
+}
+
+// addBranchCompletions completes the [branch] argument of `gwq add`.
+// Remote-only branches are offered by their local name ("origin/x" -> "x"):
+// `git worktree add <path> x` then creates a local x tracking origin/x,
+// whereas "origin/x" itself would give a detached HEAD.
+func addBranchCompletions(branches []models.Branch, remotes []string, toComplete string) []string {
+	local := map[string]bool{}
+	for _, b := range branches {
+		if !b.IsRemote {
+			local[b.Name] = true
 		}
 	}
 
-	return completions, cobra.ShellCompDirectiveNoFileComp
+	var completions []string
+	seen := map[string]bool{}
+	for _, b := range branches {
+		name, desc := b.Name, "Local branch"
+		if b.IsRemote {
+			_, l, ok := git.SplitRemoteBranch(b.Name, remotes)
+			if !ok || local[l] {
+				continue
+			}
+			name, desc = l, "Remote branch "+b.Name
+		}
+		if seen[name] || !strings.HasPrefix(name, toComplete) {
+			continue
+		}
+		seen[name] = true
+		completions = append(completions, fmt.Sprintf("%s\t%s", name, desc))
+	}
+	return completions
+}
+
+// baseCompletions completes the [base] argument of `gwq add` with local and
+// remote branch names as-is.
+func baseCompletions(branches []models.Branch, toComplete string) []string {
+	var completions []string
+	for _, b := range branches {
+		if !strings.HasPrefix(b.Name, toComplete) {
+			continue
+		}
+		desc := "Local branch"
+		if b.IsRemote {
+			desc = "Remote branch"
+		}
+		completions = append(completions, fmt.Sprintf("%s\t%s", b.Name, desc))
+	}
+	return completions
 }
 
 // getGlobalWorktreeCompletions returns global worktree names (repo:branch format)

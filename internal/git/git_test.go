@@ -243,7 +243,7 @@ func TestAddWorktree(t *testing.T) {
 
 		// Add worktree for existing branch
 		worktreePath := filepath.Join(t.TempDir(), "existing-wt")
-		err := g.AddWorktree(worktreePath, "existing-branch", false)
+		err := g.AddWorktree(worktreePath, "existing-branch", "", false)
 		if err != nil {
 			t.Fatalf("AddWorktree() error = %v", err)
 		}
@@ -257,7 +257,7 @@ func TestAddWorktree(t *testing.T) {
 	t.Run("NewBranch", func(t *testing.T) {
 		// Add worktree with new branch
 		worktreePath := filepath.Join(t.TempDir(), "new-wt")
-		err := g.AddWorktree(worktreePath, "new-branch", true)
+		err := g.AddWorktree(worktreePath, "new-branch", "", true)
 		if err != nil {
 			t.Fatalf("AddWorktree() with new branch error = %v", err)
 		}

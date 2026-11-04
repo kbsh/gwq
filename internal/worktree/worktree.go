@@ -16,8 +16,7 @@ import (
 // GitInterface defines the git operations used by Manager.
 type GitInterface interface {
 	ListWorktrees() ([]models.Worktree, error)
-	AddWorktree(path, branch string, createBranch bool) error
-	AddWorktreeFromBase(path, branch, baseBranch string) error
+	AddWorktree(path, branch, base string, createBranch bool) error
 	RemoveWorktree(path string, force bool) error
 	DeleteBranch(branch string, force bool) error
 	PruneWorktrees() error
@@ -41,34 +40,32 @@ func New(g GitInterface, config *models.Config) *Manager {
 	}
 }
 
-// Add creates a new worktree and returns the path of the created worktree.
-func (m *Manager) Add(branch string, customPath string, createBranch bool) (string, error) {
-	path, err := m.preparePath(customPath, branch)
-	if err != nil {
-		return "", err
-	}
-
-	if err := m.git.AddWorktree(path, branch, createBranch); err != nil {
-		return "", err
-	}
-
-	m.runPostWorktreeSetup(branch, path)
-	return path, nil
+// AddOptions configures Manager.Add.
+type AddOptions struct {
+	// Branch is the branch to check out, or to create if CreateBranch is set.
+	Branch string
+	// Base is the starting point of a new branch (HEAD when empty).
+	// It requires CreateBranch.
+	Base string
+	// Path is the worktree path. When empty it is generated from the
+	// naming template.
+	Path string
+	// CreateBranch creates Branch instead of checking out an existing one.
+	CreateBranch bool
 }
 
-// AddFromBase creates a new worktree with a branch from a specific base branch
-// and returns the path of the created worktree.
-func (m *Manager) AddFromBase(branch string, baseBranch string, customPath string) (string, error) {
-	path, err := m.preparePath(customPath, branch)
+// Add creates a new worktree and returns the path of the created worktree.
+func (m *Manager) Add(opts AddOptions) (string, error) {
+	path, err := m.preparePath(opts.Path, opts.Branch)
 	if err != nil {
 		return "", err
 	}
 
-	if err := m.git.AddWorktreeFromBase(path, branch, baseBranch); err != nil {
+	if err := m.git.AddWorktree(path, opts.Branch, opts.Base, opts.CreateBranch); err != nil {
 		return "", err
 	}
 
-	m.runPostWorktreeSetup(branch, path)
+	m.runPostWorktreeSetup(opts.Branch, path)
 	return path, nil
 }
 
@@ -144,6 +141,13 @@ func (m *Manager) GetMatchingWorktrees(pattern string) ([]models.Worktree, error
 
 // ValidateWorktreePath checks if a path can be used for a new worktree.
 func (m *Manager) ValidateWorktreePath(path string) error {
+	// Expand the same way preparePath does so we check the directory that
+	// will actually be used (e.g. "--path=~/x" is not expanded by the shell).
+	path, err := utils.ExpandPath(path)
+	if err != nil {
+		return fmt.Errorf("failed to expand path: %w", err)
+	}
+
 	info, err := os.Stat(path)
 	if err == nil {
 		if info.IsDir() {
