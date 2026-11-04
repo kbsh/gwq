@@ -24,6 +24,10 @@ type mockGit struct {
 	deleteBranchError error
 	recentCommits     []models.CommitInfo
 	mainRepoPathError error
+
+	// Arguments of the last AddWorktree call.
+	lastAddBase         string
+	lastAddCreateBranch bool
 }
 
 func (m *mockGit) ListWorktrees() ([]models.Worktree, error) {
@@ -33,7 +37,9 @@ func (m *mockGit) ListWorktrees() ([]models.Worktree, error) {
 	return m.worktrees, nil
 }
 
-func (m *mockGit) AddWorktree(path, branch string, createBranch bool) error {
+func (m *mockGit) AddWorktree(path, branch, base string, createBranch bool) error {
+	m.lastAddBase = base
+	m.lastAddCreateBranch = createBranch
 	if m.addError != nil {
 		return m.addError
 	}
@@ -100,21 +106,11 @@ func (m *mockGit) GetMainRepositoryPath() (string, error) {
 	return m.repoPath, nil
 }
 
-func (m *mockGit) AddWorktreeFromBase(path, branch, baseBranch string) error {
-	if m.addError != nil {
-		return m.addError
-	}
-	m.worktrees = append(m.worktrees, models.Worktree{
-		Path:   path,
-		Branch: branch,
-	})
-	return nil
-}
-
 func TestManagerAdd(t *testing.T) {
 	tests := []struct {
 		name         string
 		branch       string
+		base         string
 		customPath   string
 		createBranch bool
 		config       *models.Config
@@ -156,6 +152,19 @@ func TestManagerAdd(t *testing.T) {
 			},
 			wantErr: false,
 		},
+		{
+			name:         "CreateNewBranchFromBase",
+			branch:       "feature/new",
+			base:         "origin/main",
+			createBranch: true,
+			config: &models.Config{
+				Worktree: models.WorktreeConfig{
+					BaseDir:   t.TempDir(),
+					AutoMkdir: true,
+				},
+			},
+			wantErr: false,
+		},
 	}
 
 	for _, tt := range tests {
@@ -163,7 +172,7 @@ func TestManagerAdd(t *testing.T) {
 			mockG := &mockGit{}
 			m := New(mockG, tt.config)
 
-			_, err := m.Add(tt.branch, tt.customPath, tt.createBranch)
+			_, err := m.Add(AddOptions{Branch: tt.branch, Base: tt.base, Path: tt.customPath, CreateBranch: tt.createBranch})
 			if (err != nil) != tt.wantErr {
 				t.Errorf("Add() error = %v, wantErr %v", err, tt.wantErr)
 				return
@@ -177,6 +186,12 @@ func TestManagerAdd(t *testing.T) {
 				// Verify worktree was added
 				if len(mockG.worktrees) != 1 {
 					t.Errorf("Expected 1 worktree, got %d", len(mockG.worktrees))
+				}
+				if mockG.lastAddBase != tt.base {
+					t.Errorf("AddWorktree base = %q, want %q", mockG.lastAddBase, tt.base)
+				}
+				if mockG.lastAddCreateBranch != tt.createBranch {
+					t.Errorf("AddWorktree createBranch = %v, want %v", mockG.lastAddCreateBranch, tt.createBranch)
 				}
 			}
 		})
@@ -365,6 +380,27 @@ func TestManagerGetMatchingWorktrees(t *testing.T) {
 				}
 			}
 		})
+	}
+}
+
+// TestManagerValidateWorktreePathExpandsTilde guards against validating
+// "./~/x" while preparePath later creates the worktree in "$HOME/x".
+func TestManagerValidateWorktreePathExpandsTilde(t *testing.T) {
+	home := t.TempDir()
+	t.Setenv("HOME", home)
+
+	dir := filepath.Join(home, "nonempty")
+	if err := os.MkdirAll(dir, 0755); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.WriteFile(filepath.Join(dir, "file.txt"), []byte("content"), 0644); err != nil {
+		t.Fatal(err)
+	}
+
+	m := New(nil, &models.Config{})
+	err := m.ValidateWorktreePath("~/nonempty")
+	if err == nil || !strings.Contains(err.Error(), "directory is not empty") {
+		t.Errorf("ValidateWorktreePath(~/nonempty) error = %v, want 'directory is not empty'", err)
 	}
 }
 
@@ -570,7 +606,7 @@ func TestManagerAdd_ConfigurableSetupIntegration(t *testing.T) {
 	mockG := &mockGit{repoPath: repoDir}
 	m := New(mockG, cfg)
 
-	_, err = m.Add("feature/test", filepath.Join(worktreeDir, "wt1"), false)
+	_, err = m.Add(AddOptions{Branch: "feature/test", Path: filepath.Join(worktreeDir, "wt1")})
 	if err != nil {
 		t.Fatalf("Add() error = %v", err)
 	}
@@ -616,7 +652,7 @@ func TestManagerAdd_SetupFromWorktreeContext(t *testing.T) {
 	mockG := &mockGit{repoPath: repoDir}
 	m := New(mockG, cfg)
 
-	_, err = m.Add("feature/wt-test", filepath.Join(worktreeDir, "wt1"), false)
+	_, err = m.Add(AddOptions{Branch: "feature/wt-test", Path: filepath.Join(worktreeDir, "wt1")})
 	if err != nil {
 		t.Fatalf("Add() error = %v", err)
 	}
